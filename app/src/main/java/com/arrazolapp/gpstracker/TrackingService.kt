@@ -22,7 +22,6 @@ class TrackingService : Service() {
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
         const val ACTION_STANDBY = "ACTION_STANDBY"
-        const val ACTION_WATCHDOG = "ACTION_WATCHDOG"
 
         var isRunning = false
             private set
@@ -41,21 +40,39 @@ class TrackingService : Service() {
     // ── Watchdog: reinicia el GPS si deja de recibir updates ──
     private val watchdogHandler = Handler(Looper.getMainLooper())
     private var lastLocationTime = 0L
-    private val WATCHDOG_INTERVAL = 60_000L  // revisar cada 60s
-    private val WATCHDOG_TIMEOUT  = 90_000L  // si no hay update en 90s → reiniciar GPS
+    private val WATCHDOG_INTERVAL = 60_000L   // revisar cada 60s
+    private val WATCHDOG_TIMEOUT  = 90_000L   // si no hay update en 90s → reiniciar GPS
 
     private val watchdogRunnable = object : Runnable {
         override fun run() {
             if (isTracking) {
                 val now = System.currentTimeMillis()
+                // ── Watchdog GPS: reiniciar si no hay updates ──
                 if (lastLocationTime > 0 && (now - lastLocationTime) > WATCHDOG_TIMEOUT) {
-                    Log.w(TAG, "Watchdog: sin updates por ${(now-lastLocationTime)/1000}s — reiniciando GPS")
+                    Log.w(TAG, "⚠️ Watchdog: sin updates por ${(now - lastLocationTime) / 1000}s — reiniciando GPS")
                     restartGPS()
+                }
+                // ── Watchdog Firebase: reconectar si está desconectado ──
+                if (!isFirebaseConnected) {
+                    Log.w(TAG, "⚠️ Watchdog: Firebase desconectado — forzando reconexión")
+                    try {
+                        val db = FirebaseDatabase.getInstance()
+                        db.goOffline()
+                        Thread.sleep(300)
+                        db.goOnline()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Watchdog reconnect error: ${e.message}")
+                    }
                 }
             }
             watchdogHandler.postDelayed(this, WATCHDOG_INTERVAL)
         }
     }
+
+    // ── Monitor de conexión Firebase ──
+    private var isFirebaseConnected = true
+    private var firebaseFailCount = 0
+    private val MAX_FAIL_BEFORE_RECONNECT = 3
 
     // ── Gestor de visitas a clientes ──
     private lateinit var visitaManager: VisitaManager
@@ -83,7 +100,11 @@ class TrackingService : Service() {
 
         // ── Iniciar watchdog ──
         watchdogHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL)
-        Log.d(TAG, "WakeLock adquirido + Watchdog iniciado")
+
+        // ── Monitorear conexión Firebase ──
+        startConnectionMonitor()
+
+        Log.d(TAG, "✅ WakeLock + Watchdog + Firebase monitor iniciados")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -93,12 +114,12 @@ class TrackingService : Service() {
             ACTION_STOP -> {
                 // Verificar si el agente tiene permiso para detener el tracking
                 val prefs = getSharedPreferences("agent_config", MODE_PRIVATE)
-                // allowStop default=false — solo el admin puede detener
-                val allowStop = prefs.getBoolean("allowStop", false)
+                val allowStop = prefs.getBoolean("allowStop", true)
                 if (allowStop) {
                     stopGPS()
                 } else {
-                    Log.d(TAG, "ACTION_STOP ignorado: solo el admin puede detener")
+                    // Ignorar — el tracking solo puede ser detenido por el admin
+                    Log.d(TAG, "ACTION_STOP ignorado: allowStop=false (solo el admin puede detener)")
                 }
                 return START_STICKY
             }
@@ -137,10 +158,6 @@ class TrackingService : Service() {
     private fun startGPS() {
         isRunning = true
         isTracking = true
-
-        // ── Persistir estado para auto-reinicio ──
-        getSharedPreferences("agent_config", MODE_PRIVATE)
-            .edit().putBoolean("trackingActive", true).apply()
 
         val notification = buildNotification("Iniciando GPS...", true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -226,10 +243,6 @@ class TrackingService : Service() {
         locationCallback?.let { fusedClient.removeLocationUpdates(it) }
         locationCallback = null
 
-        // ── Persistir estado: el admin lo detuvo, no reiniciar solo ──
-        getSharedPreferences("agent_config", MODE_PRIVATE)
-            .edit().putBoolean("trackingActive", false).apply()
-
         // ── Cerrar visita activa si hay una ──
         val prefs = getSharedPreferences("agent_config", MODE_PRIVATE)
         visitaManager.detener(
@@ -264,7 +277,7 @@ class TrackingService : Service() {
 
                 val forceStart = data["forceStart"] as? Boolean ?: false
                 val forceStop = data["forceStop"] as? Boolean ?: false
-                val allowStop = data["allowStop"] as? Boolean ?: false
+                val allowStop = data["allowStop"] as? Boolean ?: true
                 val schedEnabled = data["scheduleEnabled"] as? Boolean ?: false
                 val allowedStart = data["allowedStart"] as? String
                 val allowedEnd = data["allowedEnd"] as? String
@@ -321,13 +334,42 @@ class TrackingService : Service() {
         )
 
         val db = FirebaseDatabase.getInstance()
-        db.getReference("companies/$companyId/tracking/$userId").updateChildren(data)
 
+        // ── Escritura tracking con listeners de éxito/fallo ──
+        db.getReference("companies/$companyId/tracking/$userId")
+            .updateChildren(data)
+            .addOnSuccessListener {
+                if (firebaseFailCount > 0) {
+                    Log.d(TAG, "✅ Firebase recuperado después de $firebaseFailCount fallos")
+                }
+                firebaseFailCount = 0
+            }
+            .addOnFailureListener { e ->
+                firebaseFailCount++
+                Log.e(TAG, "❌ Firebase tracking FAIL #$firebaseFailCount: ${e.message}")
+                // Si acumula fallos, forzar reconexión del socket
+                if (firebaseFailCount >= MAX_FAIL_BEFORE_RECONNECT) {
+                    Log.w(TAG, "⚠️ Demasiados fallos — forzando reconexión Firebase")
+                    try {
+                        db.goOffline()
+                        Thread.sleep(500)
+                        db.goOnline()
+                        firebaseFailCount = 0
+                        Log.d(TAG, "🔄 Reconexión Firebase forzada")
+                    } catch (ex: Exception) {
+                        Log.e(TAG, "Error en reconexión: ${ex.message}")
+                    }
+                }
+            }
+
+        // ── Escritura historial con listener ──
         val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         db.getReference("companies/$companyId/history/$userId/$today").push().setValue(
             hashMapOf("lat" to lat, "lng" to lng, "speed" to speed,
                 "battery" to getBatteryLevel(), "timestamp" to System.currentTimeMillis())
-        )
+        ).addOnFailureListener { e ->
+            Log.e(TAG, "❌ Firebase history FAIL: ${e.message}")
+        }
     }
 
     private fun markOnline() {
@@ -376,7 +418,11 @@ class TrackingService : Service() {
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(if (showStop) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_MIN)
 
-        // Botón Detener eliminado — el agente no puede detener desde la notificación
+        if (showStop) {
+            val stopIntent = Intent(this, TrackingService::class.java).apply { action = ACTION_STOP }
+            val stopPending = PendingIntent.getService(this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            builder.addAction(R.drawable.ic_notification, "Detener", stopPending)
+        }
         return builder.build()
     }
 
@@ -393,17 +439,41 @@ class TrackingService : Service() {
         return bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
     }
 
-    private fun haversine(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val R = 6371.0; val dLat = Math.toRadians(lat2 - lat1); val dLon = Math.toRadians(lon2 - lon1)
-        val a = sin(dLat / 2).pow(2) + cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLon / 2).pow(2)
-        return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+    /**
+     * Monitorea .info/connected de Firebase en tiempo real.
+     * Cuando la conexión vuelve después de una caída, re-marca online
+     * y envía el último punto conocido para cerrar el "hueco" de datos.
+     */
+    private fun startConnectionMonitor() {
+        val connRef = FirebaseDatabase.getInstance().getReference(".info/connected")
+        connRef.addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val connected = snapshot.getValue(Boolean::class.java) ?: false
+                isFirebaseConnected = connected
+                Log.d(TAG, if (connected) "🟢 Firebase CONECTADO" else "🔴 Firebase DESCONECTADO")
+                if (connected) {
+                    firebaseFailCount = 0
+                    if (isTracking) {
+                        markOnline()
+                        // Enviar último punto conocido para que no haya hueco
+                        if (lastLat != 0.0 && lastLng != 0.0) {
+                            sendToFirebase(lastLat, lastLng, lastSpeed)
+                        }
+                    }
+                }
+            }
+            override fun onCancelled(error: DatabaseError) {
+                Log.e(TAG, "Connection monitor error: ${error.message}")
+            }
+        })
     }
 
-    private fun Double.f(n: Int) = String.format("%.${n}f", this)
-
-    // ── Reiniciar GPS sin perder el estado de tracking ──
+    /**
+     * Reinicia el GPS sin perder el estado de tracking.
+     * Llamado por el watchdog cuando no hay updates por >90 segundos.
+     */
     private fun restartGPS() {
-        Log.d(TAG, "Reiniciando GPS...")
+        Log.d(TAG, "🔄 Reiniciando GPS...")
         locationCallback?.let { fusedClient.removeLocationUpdates(it) }
         locationCallback = null
         lastLocationTime = System.currentTimeMillis()
@@ -460,38 +530,36 @@ class TrackingService : Service() {
                 })
             }
         }
+
         try {
             fusedClient.requestLocationUpdates(locationRequest, locationCallback!!, Looper.getMainLooper())
-            Log.d(TAG, "GPS reiniciado correctamente")
+            Log.d(TAG, "✅ GPS reiniciado exitosamente")
         } catch (e: SecurityException) {
-            Log.e(TAG, "Sin permisos de GPS en restart", e)
+            Log.e(TAG, "Error reiniciando GPS: ${e.message}")
         }
     }
+
+    private fun haversine(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val R = 6371.0; val dLat = Math.toRadians(lat2 - lat1); val dLon = Math.toRadians(lon2 - lon1)
+        val a = sin(dLat / 2).pow(2) + cos(Math.toRadians(lat1)) * cos(Math.toRadians(lat2)) * sin(dLon / 2).pow(2)
+        return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+    }
+
+    private fun Double.f(n: Int) = String.format("%.${n}f", this)
 
     override fun onDestroy() {
         super.onDestroy()
         controlListener?.let { controlRef?.removeEventListener(it) }
         controlListener = null
+
+        // ── Liberar WakeLock y detener Watchdog ──
+        try { wakeLock?.release() } catch (e: Exception) {}
         watchdogHandler.removeCallbacks(watchdogRunnable)
 
-        // ── Liberar WakeLock ──
-        try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (e: Exception) {}
-
-        // ── Android mató el servicio → reiniciarlo en el mismo modo que estaba ──
         if (isRunning) {
-            Log.w(TAG, "Servicio destruido por Android — reiniciando automáticamente...")
-            // Capturar ANTES de resetear los flags
-            val wasTracking = isTracking
-            isRunning = false
-            isTracking = false
-            val i = Intent(this, TrackingService::class.java).apply {
-                action = if (wasTracking) ACTION_START else ACTION_STANDBY
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(i)
-            } else {
-                startService(i)
-            }
+            isRunning = false; isTracking = false
+            val i = Intent(this, TrackingService::class.java).apply { action = ACTION_STANDBY }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
         }
     }
 }
