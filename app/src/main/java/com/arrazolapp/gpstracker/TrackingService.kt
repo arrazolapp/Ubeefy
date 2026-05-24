@@ -1,10 +1,17 @@
 package com.arrazolapp.gpstracker
 
 import android.app.*
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.*
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.android.gms.location.*
@@ -74,6 +81,29 @@ class TrackingService : Service() {
     private var firebaseFailCount = 0
     private val MAX_FAIL_BEFORE_RECONNECT = 3
 
+    // ── NetworkCallback: detecta cuando vuelve la red ──
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var lastRecoveryTime = 0L
+    private val RECOVERY_DEBOUNCE = 10_000L  // máx 1 recovery cada 10s
+
+    // ── Receiver: detecta modo avión on/off ──
+    private val airplaneModeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == Intent.ACTION_AIRPLANE_MODE_CHANGED) {
+                val isAirplane = Settings.Global.getInt(
+                    contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0
+                ) != 0
+                Log.d(TAG, if (isAirplane) "✈️ Modo avión ACTIVADO" else "✈️ Modo avión DESACTIVADO")
+                if (!isAirplane) {
+                    // Esperar 5s para que los radios (GPS + celular) se inicialicen
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        onNetworkRecovered("airplane_off")
+                    }, 5000)
+                }
+            }
+        }
+    }
+
     // ── Gestor de visitas a clientes ──
     private lateinit var visitaManager: VisitaManager
 
@@ -104,7 +134,19 @@ class TrackingService : Service() {
         // ── Monitorear conexión Firebase ──
         startConnectionMonitor()
 
-        Log.d(TAG, "✅ WakeLock + Watchdog + Firebase monitor iniciados")
+        // ── Detectar cambios de red (WiFi/celular vuelve) ──
+        registerNetworkCallback()
+
+        // ── Detectar modo avión on/off ──
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(airplaneModeReceiver,
+                IntentFilter(Intent.ACTION_AIRPLANE_MODE_CHANGED), RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(airplaneModeReceiver,
+                IntentFilter(Intent.ACTION_AIRPLANE_MODE_CHANGED))
+        }
+
+        Log.d(TAG, "✅ WakeLock + Watchdog + Firebase monitor + Network monitor + Airplane listener iniciados")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -158,6 +200,10 @@ class TrackingService : Service() {
     private fun startGPS() {
         isRunning = true
         isTracking = true
+
+        // Persistir estado para auto-inicio al reiniciar
+        getSharedPreferences("agent_config", MODE_PRIVATE)
+            .edit().putBoolean("trackingActive", true).apply()
 
         val notification = buildNotification("Iniciando GPS...", true)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -242,6 +288,10 @@ class TrackingService : Service() {
         isTracking = false
         locationCallback?.let { fusedClient.removeLocationUpdates(it) }
         locationCallback = null
+
+        // Persistir estado: el tracking fue detenido intencionalmente
+        getSharedPreferences("agent_config", MODE_PRIVATE)
+            .edit().putBoolean("trackingActive", false).apply()
 
         // ── Cerrar visita activa si hay una ──
         val prefs = getSharedPreferences("agent_config", MODE_PRIVATE)
@@ -455,7 +505,6 @@ class TrackingService : Service() {
                     firebaseFailCount = 0
                     if (isTracking) {
                         markOnline()
-                        // Enviar último punto conocido para que no haya hueco
                         if (lastLat != 0.0 && lastLng != 0.0) {
                             sendToFirebase(lastLat, lastLng, lastSpeed)
                         }
@@ -466,6 +515,83 @@ class TrackingService : Service() {
                 Log.e(TAG, "Connection monitor error: ${error.message}")
             }
         })
+    }
+
+    /**
+     * Registra un NetworkCallback para detectar cuando WiFi/celular vuelve.
+     * Esto complementa al airplane receiver — cubre pérdidas de red sin modo avión.
+     */
+    private fun registerNetworkCallback() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+
+        networkCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Log.d(TAG, "🌐 Red disponible")
+                // Esperar 2s para que la red se estabilice
+                Handler(Looper.getMainLooper()).postDelayed({
+                    onNetworkRecovered("network_available")
+                }, 2000)
+            }
+
+            override fun onLost(network: Network) {
+                Log.w(TAG, "📵 Red perdida — Firebase seguirá encolando en disco")
+            }
+        }
+
+        cm.registerNetworkCallback(request, networkCallback!!)
+        Log.d(TAG, "NetworkCallback registrado")
+    }
+
+    private fun unregisterNetworkCallback() {
+        networkCallback?.let {
+            try {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                cm.unregisterNetworkCallback(it)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error unregistering NetworkCallback: ${e.message}")
+            }
+        }
+        networkCallback = null
+    }
+
+    /**
+     * Punto central de recuperación. Llamado cuando:
+     * - El modo avión se desactiva
+     * - Una red WiFi/celular se vuelve disponible
+     * Tiene debounce de 10s para evitar llamadas repetidas.
+     */
+    private fun onNetworkRecovered(source: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastRecoveryTime < RECOVERY_DEBOUNCE) {
+            Log.d(TAG, "Recovery ignorado (debounce) — fuente: $source")
+            return
+        }
+        lastRecoveryTime = now
+        Log.d(TAG, "🔄 Recovery activado por: $source")
+
+        // 1. Forzar reconexión Firebase
+        try {
+            val db = FirebaseDatabase.getInstance()
+            db.goOffline()
+            Thread.sleep(500)
+            db.goOnline()
+            Log.d(TAG, "✅ Firebase reconectado")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error reconectando Firebase: ${e.message}")
+        }
+
+        // 2. Si estaba trackeando, reiniciar GPS + re-marcar online
+        if (isTracking) {
+            restartGPS()
+            markOnline()
+            if (lastLat != 0.0 && lastLng != 0.0) {
+                sendToFirebase(lastLat, lastLng, lastSpeed)
+                Log.d(TAG, "✅ Último punto re-enviado: $lastLat, $lastLng")
+            }
+        }
     }
 
     /**
@@ -556,9 +682,17 @@ class TrackingService : Service() {
         try { wakeLock?.release() } catch (e: Exception) {}
         watchdogHandler.removeCallbacks(watchdogRunnable)
 
+        // ── Desregistrar listeners de red y modo avión ──
+        unregisterNetworkCallback()
+        try { unregisterReceiver(airplaneModeReceiver) } catch (e: Exception) {}
+
         if (isRunning) {
+            Log.w(TAG, "⚠️ Servicio destruido por Android — reiniciando automáticamente...")
+            val wasTracking = isTracking
             isRunning = false; isTracking = false
-            val i = Intent(this, TrackingService::class.java).apply { action = ACTION_STANDBY }
+            val i = Intent(this, TrackingService::class.java).apply {
+                action = if (wasTracking) ACTION_START else ACTION_STANDBY
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
         }
     }
