@@ -508,6 +508,7 @@ class TrackingService : Service() {
                         if (lastLat != 0.0 && lastLng != 0.0) {
                             sendToFirebase(lastLat, lastLng, lastSpeed)
                         }
+                        visitaManager.flushPendingVisitas()
                     }
                 }
             }
@@ -591,6 +592,8 @@ class TrackingService : Service() {
                 sendToFirebase(lastLat, lastLng, lastSpeed)
                 Log.d(TAG, "✅ Último punto re-enviado: $lastLat, $lastLng")
             }
+            // 3. Enviar visitas que quedaron pendientes durante el corte de señal
+            visitaManager.flushPendingVisitas()
         }
     }
 
