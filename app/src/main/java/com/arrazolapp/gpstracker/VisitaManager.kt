@@ -15,7 +15,7 @@ class VisitaManager(private val context: Context) {
         const val TAG = "VisitaManager"
         const val MIN_VISITA_SEG = 60
         const val RADIO_DEFAULT_M = 50.0
-        const val RADIO_MIN_M = 50.0
+        const val RADIO_MIN_M = 10.0        // ✅ Bajado de 50 a 10 para respetar geocercas pequeñas
         const val PENDING_PREFS = "pending_visitas"
         const val PENDING_KEY = "queue"
     }
@@ -39,8 +39,44 @@ class VisitaManager(private val context: Context) {
     private var clientesRef: DatabaseReference? = null
     private var clientesListener: ValueEventListener? = null
 
+    // ── referencia de debug (se setea en iniciar()) ──
+    private var debugRef: DatabaseReference? = null
+    private var currentCompanyId: String = ""
+    private var currentAgenteName: String = ""
+
+    // ═══════════════════════════════════════════════════════════
+    // HELPER: Escribir log en Firebase  companies/{id}/debug_logs
+    // ═══════════════════════════════════════════════════════════
+    private fun fireLog(nivel: String, mensaje: String, extra: Map<String, Any> = emptyMap()) {
+        Log.d(TAG, "[$nivel] $mensaje")
+        try {
+            val ref = debugRef ?: return
+            val ts = System.currentTimeMillis()
+            val hora = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(ts))
+            val payload = hashMapOf<String, Any>(
+                "ts"      to ts,
+                "hora"    to hora,
+                "nivel"   to nivel,
+                "agente"  to currentAgenteName,
+                "msg"     to mensaje
+            )
+            payload.putAll(extra)
+            ref.push().setValue(payload)
+        } catch (e: Exception) {
+            Log.e(TAG, "fireLog error: ${e.message}")
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // INICIAR
+    // ═══════════════════════════════════════════════════════════
     fun iniciar(companyId: String) {
-        Log.d(TAG, "Iniciando VisitaManager para company=$companyId")
+        currentCompanyId = companyId
+        debugRef = FirebaseDatabase.getInstance()
+            .getReference("companies/$companyId/debug_logs")
+
+        fireLog("INFO", "VisitaManager iniciado", mapOf("companyId" to companyId))
+
         clientesRef = FirebaseDatabase.getInstance().getReference("companies/$companyId/clientes")
         clientesListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
@@ -60,6 +96,8 @@ class VisitaManager(private val context: Context) {
                         is Double -> v; is Long -> v.toDouble()
                         is String -> v.toDoubleOrNull() ?: RADIO_DEFAULT_M; else -> RADIO_DEFAULT_M
                     }
+                    // ✅ Ahora respeta geocercas desde 10m
+                    val radioFinal = if (radio < RADIO_MIN_M) RADIO_DEFAULT_M else radio
                     lista.add(Cliente(
                         id = child.key ?: continue,
                         nombre    = data["nombre"]?.toString() ?: "",
@@ -67,26 +105,57 @@ class VisitaManager(private val context: Context) {
                         zona      = data["zona"]?.toString() ?: "",
                         direccion = data["direccion"]?.toString() ?: "",
                         lat = lat, lng = lng,
-                        radioM = if (radio < RADIO_MIN_M) RADIO_DEFAULT_M else radio
+                        radioM = radioFinal
                     ))
                 }
                 clientes = lista
-                Log.d(TAG, "${clientes.size} clientes cargados")
+                fireLog("INFO", "${clientes.size} clientes cargados en memoria",
+                    mapOf("total" to clientes.size))
             }
             override fun onCancelled(error: DatabaseError) {
-                Log.e(TAG, "Error cargando clientes: ${error.message}")
+                fireLog("ERROR", "Error cargando clientes: ${error.message}")
             }
         }
         clientesRef?.addValueEventListener(clientesListener!!)
-
-        // Al iniciar, intentar enviar visitas pendientes de sesiones anteriores
         flushPendingVisitas()
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // ON LOCATION UPDATE
+    // ═══════════════════════════════════════════════════════════
     fun onLocationUpdate(lat: Double, lng: Double, companyId: String,
                          agenteName: String, agenteRol: String, webhookUrl: String) {
-        if (clientes.isEmpty()) return
+
+        currentAgenteName = agenteName
+
+        // ── DIAGNÓSTICO: sin clientes cargados ──
+        if (clientes.isEmpty()) {
+            fireLog("WARN", "GPS update ignorado — 0 clientes en memoria",
+                mapOf("lat" to lat, "lng" to lng))
+            return
+        }
+
+        // ── Calcular distancia a cada cliente para diagnóstico ──
         val clienteActual = clientes.firstOrNull { distanciaMetros(lat, lng, it.lat, it.lng) <= it.radioM }
+
+        // ── Log del cliente más cercano (cada update, útil para debug) ──
+        val masCercano = clientes.minByOrNull { distanciaMetros(lat, lng, it.lat, it.lng) }
+        if (masCercano != null) {
+            val distancia = distanciaMetros(lat, lng, masCercano.lat, masCercano.lng)
+            // Solo logueamos cuando estamos a menos de 200m de algún cliente (evita spam)
+            if (distancia < 200) {
+                fireLog("GPS", "Más cercano: ${masCercano.nombre} — ${distancia.toInt()}m (geocerca: ${masCercano.radioM.toInt()}m)",
+                    mapOf(
+                        "clienteNombre" to masCercano.nombre,
+                        "distanciaM"    to distancia.toInt(),
+                        "geocercaM"     to masCercano.radioM.toInt(),
+                        "dentroGeocerca" to (clienteActual?.id == masCercano.id),
+                        "agentelat"     to lat,
+                        "agenteLng"     to lng
+                    ))
+            }
+        }
+
         when {
             clienteActual != null && visitaActiva == null -> {
                 val ahora = System.currentTimeMillis()
@@ -100,10 +169,17 @@ class VisitaManager(private val context: Context) {
                     entradaTs   = ahora,
                     horaEntrada = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(ahora))
                 )
-                Log.d(TAG, "ENTRADA: ${clienteActual.nombre} a las ${visitaActiva!!.horaEntrada}")
+                fireLog("ENTRADA", "Entró a geocerca: ${clienteActual.nombre}",
+                    mapOf(
+                        "clienteId"     to clienteActual.id,
+                        "clienteNombre" to clienteActual.nombre,
+                        "horaEntrada"   to visitaActiva!!.horaEntrada,
+                        "geocercaM"     to clienteActual.radioM.toInt()
+                    ))
             }
             clienteActual != null && visitaActiva != null &&
             clienteActual.id != visitaActiva!!.clienteId -> {
+                fireLog("INFO", "Cambio de cliente: ${visitaActiva!!.clienteNombre} → ${clienteActual.nombre}")
                 cerrarVisita(companyId, agenteName, agenteRol)
                 val ahora = System.currentTimeMillis()
                 visitaActiva = VisitaActiva(
@@ -116,26 +192,50 @@ class VisitaManager(private val context: Context) {
                     entradaTs   = ahora,
                     horaEntrada = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(ahora))
                 )
-                Log.d(TAG, "CAMBIO DE CLIENTE: ${clienteActual.nombre}")
             }
-            clienteActual == null && visitaActiva != null -> cerrarVisita(companyId, agenteName, agenteRol)
+            clienteActual == null && visitaActiva != null -> {
+                fireLog("SALIDA", "Salió de geocerca: ${visitaActiva!!.clienteNombre}",
+                    mapOf("clienteNombre" to visitaActiva!!.clienteNombre))
+                cerrarVisita(companyId, agenteName, agenteRol)
+            }
             else -> {}
         }
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // CERRAR VISITA
+    // ═══════════════════════════════════════════════════════════
     private fun cerrarVisita(companyId: String, agenteName: String, agenteRol: String) {
         val visita = visitaActiva ?: return
         visitaActiva = null
         val salidaTs    = System.currentTimeMillis()
         val duracionSeg = ((salidaTs - visita.entradaTs) / 1000).toInt()
+
+        // ── DIAGNÓSTICO: visita muy corta ──
         if (duracionSeg < MIN_VISITA_SEG) {
-            Log.d(TAG, "Visita ignorada (${duracionSeg}s): ${visita.clienteNombre}"); return
+            fireLog("IGNORADA", "Visita demasiado corta — NO registrada",
+                mapOf(
+                    "clienteNombre" to visita.clienteNombre,
+                    "duracionSeg"   to duracionSeg,
+                    "minimoSeg"     to MIN_VISITA_SEG,
+                    "razon"         to "Duración ${duracionSeg}s < mínimo ${MIN_VISITA_SEG}s"
+                ))
+            return
         }
+
         val durMinRedon = Math.round(duracionSeg / 60.0 * 10.0) / 10.0
         val fecha       = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(visita.entradaTs))
         val horaSalida  = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(salidaTs))
         val idVisita    = "vis_${System.currentTimeMillis()}"
-        Log.d(TAG, "SALIDA: ${visita.clienteNombre} — ${durMinRedon} min")
+
+        fireLog("REGISTRADA", "✅ Visita válida — guardando en Firebase",
+            mapOf(
+                "visitaId"      to idVisita,
+                "clienteNombre" to visita.clienteNombre,
+                "duracionMin"   to durMinRedon,
+                "horaEntrada"   to visita.horaEntrada,
+                "horaSalida"    to horaSalida
+            ))
 
         val data = hashMapOf<String, Any>(
             "id"               to idVisita,
@@ -162,32 +262,17 @@ class VisitaManager(private val context: Context) {
             "fechaStr"         to fecha
         )
 
-        // ══════════════════════════════════════════════════════════
-        // PASO 1: Guardar en disco local PRIMERO (nunca se pierde)
-        // ══════════════════════════════════════════════════════════
         saveToPendingQueue(companyId, idVisita, data)
-
-        // ══════════════════════════════════════════════════════════
-        // PASO 2: Intentar enviar a Firebase
-        // Si tiene éxito → se elimina de la cola local
-        // Si falla → queda en cola para retry automático
-        // ══════════════════════════════════════════════════════════
         sendToFirebaseWithRetry(companyId, idVisita, data)
     }
 
     // ═══════════════════════════════════════════════════════════
-    // COLA LOCAL EN DISCO (SharedPreferences + JSON)
+    // COLA LOCAL EN DISCO
     // ═══════════════════════════════════════════════════════════
-
-    /**
-     * Guarda una visita en la cola local de SharedPreferences.
-     * Esta cola sobrevive reinicios de app y pérdidas de señal.
-     */
     private fun saveToPendingQueue(companyId: String, visitaId: String, data: Map<String, Any>) {
         try {
             val prefs = context.getSharedPreferences(PENDING_PREFS, Context.MODE_PRIVATE)
             val arr = JSONArray(prefs.getString(PENDING_KEY, "[]") ?: "[]")
-
             val obj = JSONObject()
             obj.put("_companyId", companyId)
             obj.put("_visitaId", visitaId)
@@ -207,9 +292,6 @@ class VisitaManager(private val context: Context) {
         }
     }
 
-    /**
-     * Elimina una visita de la cola local (llamado al confirmar Firebase OK).
-     */
     private fun removeFromPendingQueue(visitaId: String) {
         try {
             val prefs = context.getSharedPreferences(PENDING_PREFS, Context.MODE_PRIVATE)
@@ -217,9 +299,7 @@ class VisitaManager(private val context: Context) {
             val newArr = JSONArray()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
-                if (obj.optString("_visitaId") != visitaId) {
-                    newArr.put(obj)
-                }
+                if (obj.optString("_visitaId") != visitaId) newArr.put(obj)
             }
             prefs.edit().putString(PENDING_KEY, newArr.toString()).apply()
             Log.d(TAG, "🗑️ Visita eliminada de cola: $visitaId (quedan: ${newArr.length()})")
@@ -228,11 +308,6 @@ class VisitaManager(private val context: Context) {
         }
     }
 
-    /**
-     * Intenta enviar una visita a Firebase.
-     * Si tiene éxito, la elimina de la cola local.
-     * Si falla, queda en cola para el próximo flush.
-     */
     private fun sendToFirebaseWithRetry(companyId: String, visitaId: String, data: Map<String, Any>) {
         try {
             FirebaseDatabase.getInstance()
@@ -243,58 +318,54 @@ class VisitaManager(private val context: Context) {
                     removeFromPendingQueue(visitaId)
                 }
                 .addOnFailureListener { e ->
-                    Log.e(TAG, "❌ Firebase FAIL (queda en cola): $visitaId — ${e.message}")
-                    // No hacer nada: ya está en la cola, flushPendingVisitas lo reintentará
+                    fireLog("ERROR", "❌ Firebase FAIL — visita queda en cola local",
+                        mapOf("visitaId" to visitaId, "error" to (e.message ?: "desconocido")))
                 }
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error enviando visita: ${e.message}")
         }
     }
 
-    /**
-     * Reintenta enviar TODAS las visitas pendientes en la cola local.
-     * Llamar desde:
-     * - VisitaManager.iniciar() → al arrancar el tracking
-     * - TrackingService.onNetworkRecovered() → cuando vuelve la señal
-     */
     fun flushPendingVisitas() {
         try {
             val prefs = context.getSharedPreferences(PENDING_PREFS, Context.MODE_PRIVATE)
             val arr = JSONArray(prefs.getString(PENDING_KEY, "[]") ?: "[]")
             if (arr.length() == 0) return
-
-            Log.d(TAG, "🔄 Flush: ${arr.length()} visitas pendientes en cola")
-
+            fireLog("INFO", "Flush: ${arr.length()} visitas pendientes en cola",
+                mapOf("pendientes" to arr.length()))
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
-                val companyId = obj.optString("_companyId", "")
-                val visitaId = obj.optString("_visitaId", "")
-                if (companyId.isEmpty() || visitaId.isEmpty()) continue
-
-                // Reconstruir data map sin los campos internos _companyId, _visitaId
+                val cId = obj.optString("_companyId", "")
+                val vId = obj.optString("_visitaId", "")
+                if (cId.isEmpty() || vId.isEmpty()) continue
                 val data = hashMapOf<String, Any>()
                 val keys = obj.keys()
                 while (keys.hasNext()) {
                     val k = keys.next()
                     if (k.startsWith("_")) continue
-                    val v = obj.get(k)
-                    data[k] = v
+                    data[k] = obj.get(k)
                 }
-
-                sendToFirebaseWithRetry(companyId, visitaId, data)
+                sendToFirebaseWithRetry(cId, vId, data)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error en flush: ${e.message}")
         }
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // DETENER
+    // ═══════════════════════════════════════════════════════════
     fun detener(companyId: String, agenteName: String, agenteRol: String, webhookUrl: String) {
         if (visitaActiva != null) cerrarVisita(companyId, agenteName, agenteRol)
         clientesListener?.let { clientesRef?.removeEventListener(it) }
         clientesListener = null
+        fireLog("INFO", "VisitaManager detenido")
         Log.d(TAG, "VisitaManager detenido")
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // HAVERSINE
+    // ═══════════════════════════════════════════════════════════
     private fun distanciaMetros(lat1: Double, lng1: Double, lat2: Double, lng2: Double): Double {
         val R = 6371000.0
         val dLat = Math.toRadians(lat2 - lat1)
