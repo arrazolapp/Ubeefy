@@ -29,6 +29,7 @@ class TrackingService : Service() {
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
         const val ACTION_STANDBY = "ACTION_STANDBY"
+        const val ACTION_WATCHDOG = "ACTION_WATCHDOG"
 
         var isRunning = false
             private set
@@ -130,6 +131,9 @@ class TrackingService : Service() {
 
         // ── Iniciar watchdog ──
         watchdogHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL)
+
+        // ── Alarma periódica: resucita el servicio si Android lo mata ──
+        scheduleAlarmWatchdog()
 
         // ── Monitorear conexión Firebase ──
         startConnectionMonitor()
@@ -273,6 +277,7 @@ class TrackingService : Service() {
             fusedClient.requestLocationUpdates(locationRequest, locationCallback!!, Looper.getMainLooper())
             Log.d(TAG, "GPS tracking iniciado")
             markOnline()
+            scheduleAlarmWatchdog()  // Reprogramar alarma de resurrección
 
             // ── Iniciar detección de visitas ──
             val prefs = getSharedPreferences("agent_config", MODE_PRIVATE)
@@ -303,6 +308,7 @@ class TrackingService : Service() {
         )
 
         markOffline()
+        cancelAlarmWatchdog()  // Admin detuvo → no resucitar
         sendBroadcast(Intent("GPS_STOPPED"))
 
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -676,79 +682,23 @@ class TrackingService : Service() {
 
     private fun Double.f(n: Int) = String.format("%.${n}f", this)
 
-    override fun onDestroy() {
-        super.onDestroy()
-        controlListener?.let { controlRef?.removeEventListener(it) }
-        controlListener = null
-
-        // ── Liberar WakeLock y detener Watchdog ──
-        try { wakeLock?.release() } catch (e: Exception) {}
-        watchdogHandler.removeCallbacks(watchdogRunnable)
-
-        // ── Desregistrar listeners de red y modo avión ──
-        unregisterNetworkCallback()
-        try { unregisterReceiver(airplaneModeReceiver) } catch (e: Exception) {}
-
-        if (isRunning) {
-            Log.w(TAG, "⚠️ Servicio destruido por Android — reiniciando automáticamente...")
-            val wasTracking = isTracking
-            isRunning = false; isTracking = false
-            val i = Intent(this, TrackingService::class.java).apply {
-                action = if (wasTracking) ACTION_START else ACTION_STANDBY
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
-        }
-    }
-}
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  ADICIONES A TrackingService.kt — Servicio "inmortal"                   ║
-// ║                                                                          ║
-// ║  3 bloques para agregar al TrackingService existente:                    ║
-// ║  BLOQUE 1: Import nuevo (agregar arriba con los imports)                 ║
-// ║  BLOQUE 2: onTaskRemoved() (agregar como función nueva en la clase)      ║
-// ║  BLOQUE 3: scheduleAlarmWatchdog() + cancelAlarmWatchdog()               ║
-// ║  BLOQUE 4: Llamar scheduleAlarmWatchdog() en 3 lugares                   ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
-
-
-// ══════════════════════════════════════════════════════════════
-// BLOQUE 1: IMPORT NUEVO
-// Agregar junto a los otros imports al inicio del archivo.
-// (PendingIntent puede ya estar importado por android.app.*)
-// Si usás import android.app.* → no necesitás agregar nada.
-// ══════════════════════════════════════════════════════════════
-
-
-// ══════════════════════════════════════════════════════════════
-// BLOQUE 2: onTaskRemoved()
-// Agregar ANTES de onDestroy().
-// Se ejecuta cuando el usuario desliza la app de "recientes".
-// En Samsung/Xiaomi esto MATA el servicio si no se maneja.
-// ══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // PROTECCIÓN CONTRA CIERRE
+    // ═══════════════════════════════════════════════════════════
 
     /**
-     * Llamado cuando el usuario desliza la app de la lista de "recientes".
-     * Sin este override, en Samsung/Xiaomi/Huawei el servicio muere silenciosamente.
+     * Se ejecuta cuando el usuario desliza la app de la lista de "recientes".
+     * Sin este override, en Samsung/Xiaomi el servicio muere silenciosamente.
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         Log.w(TAG, "⚠️ App removida de recientes — protegiendo servicio")
-
-        // Programar alarma de respaldo por si Android mata el servicio
         scheduleAlarmWatchdog()
-
-        // Re-lanzar el servicio inmediatamente
         if (isTracking || isRunning) {
             val action = if (isTracking) ACTION_START else ACTION_STANDBY
-            val restartIntent = Intent(this, TrackingService::class.java).apply {
-                this.action = action
-            }
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(restartIntent)
-                } else {
-                    startService(restartIntent)
-                }
+                val i = Intent(this, TrackingService::class.java).apply { this.action = action }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
                 Log.d(TAG, "✅ Servicio re-lanzado después de swipe")
             } catch (e: Exception) {
                 Log.e(TAG, "Error re-lanzando: ${e.message}")
@@ -756,19 +706,10 @@ class TrackingService : Service() {
         }
     }
 
-
-// ══════════════════════════════════════════════════════════════
-// BLOQUE 3: scheduleAlarmWatchdog() + cancelAlarmWatchdog()
-// Agregar como funciones nuevas en la clase.
-// La alarma se dispara cada 15 minutos y si el servicio está
-// muerto, el BootReceiver lo resucita.
-// Funciona incluso en Doze mode (setExactAndAllowWhileIdle).
-// ══════════════════════════════════════════════════════════════
-
     /**
-     * Programa una alarma periódica cada 15 minutos que verifica
-     * si el servicio sigue vivo. Si Android lo mató, el BootReceiver
-     * lo resucita. Funciona incluso en Doze mode.
+     * Programa una alarma cada 15 minutos que verifica si el servicio sigue vivo.
+     * Si Android lo mató, el BootReceiver lo resucita.
+     * Funciona incluso en Doze mode (setExactAndAllowWhileIdle).
      */
     private fun scheduleAlarmWatchdog() {
         val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
@@ -779,21 +720,11 @@ class TrackingService : Service() {
             this, 9999, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
         val interval = 15 * 60 * 1000L  // 15 minutos
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            am.setExactAndAllowWhileIdle(
-                AlarmManager.RTC_WAKEUP,
-                System.currentTimeMillis() + interval,
-                pi
-            )
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + interval, pi)
         } else {
-            am.setExact(
-                AlarmManager.RTC_WAKEUP,
-                System.currentTimeMillis() + interval,
-                pi
-            )
+            am.setExact(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + interval, pi)
         }
         Log.d(TAG, "⏰ Alarm watchdog programada en 15 min")
     }
@@ -810,30 +741,30 @@ class TrackingService : Service() {
         am.cancel(pi)
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        controlListener?.let { controlRef?.removeEventListener(it) }
+        controlListener = null
 
-// ══════════════════════════════════════════════════════════════
-// BLOQUE 4: LLAMAR scheduleAlarmWatchdog() EN 3 LUGARES
-// ══════════════════════════════════════════════════════════════
-//
-// 4a. En onCreate(), al final, después del watchdog handler:
-//     watchdogHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL)
-//     scheduleAlarmWatchdog()    // ← AGREGAR
-//     Log.d(TAG, "WakeLock + Watchdog + AlarmWatchdog iniciados")
-//
-// 4b. En startGPS(), después de markOnline():
-//     markOnline()
-//     scheduleAlarmWatchdog()    // ← AGREGAR (reprograma la alarma)
-//
-// 4c. En onDestroy(), ANTES de intentar reiniciar:
-//     scheduleAlarmWatchdog()    // ← AGREGAR (última línea de defensa)
-//     if (isRunning) { ...
-//
-// ══════════════════════════════════════════════════════════════
-// NOTA SOBRE stopGPS():
-// Cuando el admin detiene el tracking intencionalmente,
-// CANCELAR la alarma para que no lo reviva:
-//
-//   En stopGPS(), agregar:
-//     cancelAlarmWatchdog()    // ← AGREGAR
-//     markOffline()
-// ══════════════════════════════════════════════════════════════
+        // ── Liberar WakeLock y detener Watchdog ──
+        try { wakeLock?.release() } catch (e: Exception) {}
+        watchdogHandler.removeCallbacks(watchdogRunnable)
+
+        // ── Desregistrar listeners de red y modo avión ──
+        unregisterNetworkCallback()
+        try { unregisterReceiver(airplaneModeReceiver) } catch (e: Exception) {}
+
+        // ── Última defensa: programar alarma por si el reinicio falla ──
+        scheduleAlarmWatchdog()
+
+        if (isRunning) {
+            Log.w(TAG, "⚠️ Servicio destruido por Android — reiniciando automáticamente...")
+            val wasTracking = isTracking
+            isRunning = false; isTracking = false
+            val i = Intent(this, TrackingService::class.java).apply {
+                action = if (wasTracking) ACTION_START else ACTION_STANDBY
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
+        }
+    }
+}
