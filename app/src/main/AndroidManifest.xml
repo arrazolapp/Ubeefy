@@ -25,6 +25,7 @@
     <!-- Evitar que Doze mate el servicio -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
     <application
         android:name=".App"
@@ -95,9 +96,10 @@
         <service
             android:name=".TrackingService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="location" />
 
-        <!-- Auto-inicio al encender el celular -->
+        <!-- Auto-inicio: boot + actualización de app + alarma watchdog -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
@@ -105,6 +107,8 @@
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="com.arrazolapp.gpstracker.WATCHDOG_ALARM" />
             </intent-filter>
         </receiver>
 
