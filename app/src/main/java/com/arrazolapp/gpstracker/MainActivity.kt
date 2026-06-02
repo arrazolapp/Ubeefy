@@ -97,6 +97,7 @@ class MainActivity : AppCompatActivity() {
 
         checkPermissions()
         requestBatteryOptimization()
+        requestAutoStart()
 
         // ── AUTO-ARRANQUE: si el tracking estaba activo antes de que Android
         //    matara el servicio, lo reiniciamos automáticamente ──────────────
@@ -278,5 +279,80 @@ class MainActivity : AppCompatActivity() {
     private fun getBatteryLevel(): Int {
         val bm = getSystemService(BATTERY_SERVICE) as android.os.BatteryManager
         return bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+    }
+
+    /**
+     * Detecta la marca del celular y guía al usuario a desactivar
+     * las restricciones de batería propietarias que matan apps en segundo plano.
+     * Solo se muestra una vez.
+     */
+    private fun requestAutoStart() {
+        val prefs = getSharedPreferences("agent_config", MODE_PRIVATE)
+        if (prefs.getBoolean("autostart_guide_shown_v2", false)) return
+
+        val manufacturer = Build.MANUFACTURER.lowercase()
+        val (title, message, intentAction) = when {
+            manufacturer.contains("samsung") -> Triple(
+                "⚡ Configuración importante",
+                "Para que el GPS funcione siempre en tu Samsung:\n\n" +
+                "1. Ir a Ajustes → Cuidado del dispositivo → Batería\n" +
+                "2. Límites de uso en segundo plano\n" +
+                "3. Quitar Ubify de \"Apps en suspensión\"\n" +
+                "4. Agregar Ubify a \"Apps que nunca se suspenden\"\n\n" +
+                "¿Abrir configuración de batería?",
+                Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS)
+            )
+            manufacturer.contains("xiaomi") || manufacturer.contains("redmi") || manufacturer.contains("poco") -> Triple(
+                "⚡ Configuración importante",
+                "Para que el GPS funcione siempre en tu Xiaomi:\n\n" +
+                "1. Ir a Ajustes → Aplicaciones → Ubify\n" +
+                "2. Ahorro de batería → Sin restricciones\n" +
+                "3. Inicio automático → Activar\n\n" +
+                "¿Abrir ajustes de la aplicación?",
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:$packageName")
+                }
+            )
+            manufacturer.contains("huawei") || manufacturer.contains("honor") -> Triple(
+                "⚡ Configuración importante",
+                "Para que el GPS funcione siempre en tu Huawei:\n\n" +
+                "1. Ir a Ajustes → Batería → Inicio de aplicaciones\n" +
+                "2. Buscar Ubify → Desactivar administración automática\n" +
+                "3. Activar: Inicio automático + Actividad en segundo plano\n\n" +
+                "¿Abrir configuración de batería?",
+                Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS)
+            )
+            manufacturer.contains("oppo") || manufacturer.contains("realme") || manufacturer.contains("oneplus") -> Triple(
+                "⚡ Configuración importante",
+                "Para que el GPS funcione siempre:\n\n" +
+                "1. Ir a Ajustes → Administración de batería\n" +
+                "2. Buscar Ubify → Permitir actividad en segundo plano\n" +
+                "3. Desactivar optimización de batería para esta app\n\n" +
+                "¿Abrir ajustes de la aplicación?",
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:$packageName")
+                }
+            )
+            else -> return
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton("Abrir ajustes") { _, _ ->
+                try {
+                    startActivity(intentAction)
+                } catch (e: Exception) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.parse("package:$packageName")
+                        })
+                    } catch (_: Exception) {}
+                }
+            }
+            .setNegativeButton("Ya lo hice", null)
+            .show()
+
+        prefs.edit().putBoolean("autostart_guide_shown_v2", true).apply()
     }
 }
