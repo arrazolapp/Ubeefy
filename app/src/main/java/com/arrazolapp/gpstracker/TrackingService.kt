@@ -712,33 +712,50 @@ class TrackingService : Service() {
      * Funciona incluso en Doze mode (setExactAndAllowWhileIdle).
      */
     private fun scheduleAlarmWatchdog() {
-        val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val intent = Intent(this, BootReceiver::class.java).apply {
-            action = BootReceiver.ACTION_WATCHDOG_ALARM
+        try {
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val intent = Intent(this, BootReceiver::class.java).apply {
+                action = BootReceiver.ACTION_WATCHDOG_ALARM
+            }
+            val pi = PendingIntent.getBroadcast(
+                this, 9999, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val interval = 15 * 60 * 1000L  // 15 minutos
+
+            // Android 12+: verificar permiso de alarmas exactas
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !am.canScheduleExactAlarms()) {
+                // Fallback a alarma inexacta (menos precisa pero no crashea)
+                am.set(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + interval, pi)
+                Log.d(TAG, "⏰ Alarm watchdog (inexacta) programada en ~15 min")
+                return
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + interval, pi)
+            } else {
+                am.setExact(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + interval, pi)
+            }
+            Log.d(TAG, "⏰ Alarm watchdog programada en 15 min")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error programando alarm watchdog: ${e.message}")
         }
-        val pi = PendingIntent.getBroadcast(
-            this, 9999, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val interval = 15 * 60 * 1000L  // 15 minutos
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + interval, pi)
-        } else {
-            am.setExact(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + interval, pi)
-        }
-        Log.d(TAG, "⏰ Alarm watchdog programada en 15 min")
     }
 
     private fun cancelAlarmWatchdog() {
-        val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val intent = Intent(this, BootReceiver::class.java).apply {
-            action = BootReceiver.ACTION_WATCHDOG_ALARM
+        try {
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val intent = Intent(this, BootReceiver::class.java).apply {
+                action = BootReceiver.ACTION_WATCHDOG_ALARM
+            }
+            val pi = PendingIntent.getBroadcast(
+                this, 9999, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            am.cancel(pi)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error cancelando alarm watchdog: ${e.message}")
         }
-        val pi = PendingIntent.getBroadcast(
-            this, 9999, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        am.cancel(pi)
     }
 
     override fun onDestroy() {
