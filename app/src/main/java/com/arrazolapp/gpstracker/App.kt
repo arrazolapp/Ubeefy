@@ -18,12 +18,12 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         try {
-            val db = FirebaseDatabase.getInstance()
-            db.setPersistenceEnabled(true)
-            Log.d("Ubify", "✅ Firebase disk persistence ENABLED — writes survive offline")
-        } catch (e: Exception) {
-            // Ya estaba habilitada (puede pasar si el proceso se recicla)
-            Log.w("Ubify", "Firebase persistence already set: ${e.message}")
+            FirebaseDatabase.getInstance().setPersistenceEnabled(true)
+            Log.d("Ubify", "✅ Firebase disk persistence ENABLED")
+        } catch (e: Throwable) {
+            // Capturar Throwable (no solo Exception) porque Firebase puede
+            // lanzar DatabaseException que a veces no se atrapa con Exception
+            Log.w("Ubify", "Firebase persistence skip: ${e.message}")
         }
     }
 }
