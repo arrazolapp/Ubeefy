@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <title>Ubeefy</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.min.css"/>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;--bearing:0deg}
 .leaflet-map-pane,.leaflet-tile-pane,.leaflet-tile{will-change:transform;backface-visibility:hidden;-webkit-backface-visibility:hidden}
@@ -17,6 +17,14 @@ body.light .leaflet-container{background:#f2ede3 !important}
 #map{position:fixed;inset:0;z-index:0;background:#2b3648}
 body.light #map{background:#f2ede3}
 .leaflet-control-zoom,.leaflet-control-attribution{display:none!important}
+/* Atribución OSM/CARTO: requerida por licencia — discreta pero visible */
+.maplibregl-ctrl-bottom-right{bottom:150px!important;right:2px!important}
+.maplibregl-ctrl-attrib{background:rgba(0,0,0,0.35)!important;border-radius:6px;font-size:8px!important;line-height:1.2;padding:1px 5px!important}
+.maplibregl-ctrl-attrib a{color:rgba(255,255,255,0.55)!important;text-decoration:none}
+.light .maplibregl-ctrl-attrib{background:rgba(255,255,255,0.55)!important}
+.light .maplibregl-ctrl-attrib a{color:rgba(0,0,0,0.5)!important}
+.maplibregl-ctrl-attrib-button{display:none!important}
+.maplibregl-canvas{outline:none}
 
 /* ── CURSOR ── */
 .nav-wrap{position:relative;width:40px;height:46px;filter:drop-shadow(0 2px 7px rgba(0,0,0,0.5));background:transparent!important;border:none!important;cursor:pointer}
@@ -24,8 +32,8 @@ body.light #map{background:#f2ede3}
 .leaflet-div-icon{background:transparent!important;border:none!important}
 .leaflet-marker-icon{background:transparent!important;border:none!important}
 .client-pin{background:transparent!important;border:none!important}
-.client-pin svg{transition:transform 0.1s ease;transform:rotate(var(--bearing, 0deg))}
-.nav-wrap svg,.nav-wrap img{transition:transform 0.1s ease;transform-origin:50% 50%}
+.client-pin svg{transition:transform 0.1s ease}
+.nav-wrap svg,.nav-wrap img{transform-origin:50% 50%}
 .nav-glow{position:absolute;inset:-14px;border-radius:50%;background:radial-gradient(circle,rgba(0,188,212,0.22) 0%,transparent 65%);animation:glow 2s ease-in-out infinite;pointer-events:none}
 @keyframes glow{0%,100%{opacity:.3;transform:scale(1)}50%{opacity:.9;transform:scale(1.3)}}
 
@@ -398,7 +406,7 @@ body.light{background:#e8e0d5}
 </div>
 <style>@keyframes menuIn{from{transform:translateX(-100%)}to{transform:translateX(0)}}</style>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
 <script>
@@ -429,8 +437,147 @@ firebase.initializeApp({
 });
 const db=firebase.database();
 
-// ═══ MAPA ═══
-const map=L.map('map',{center:[9.9381,-84.0795],zoom:16,zoomControl:false,attributionControl:false});
+// ═══ MAPA (MapLibre GL — tiles vectoriales, rotación nativa, etiquetas siempre legibles) ═══
+const CARTO_STYLES={
+  dark:'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+  light:'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json'
+};
+const ml=new maplibregl.Map({
+  container:'map',
+  style:CARTO_STYLES.dark,
+  center:[-84.0795,9.9381],
+  zoom:15,maxZoom:20,
+  attributionControl:false,
+  pitchWithRotate:false,
+  fadeDuration:80
+});
+ml.addControl(new maplibregl.AttributionControl({compact:false}),'bottom-right');
+ml.touchPitch.disable();
+
+// Cola de tareas que requieren el estilo cargado + registro para re-instalar
+// capas (rutas, círculo de precisión) cuando se cambia de tema
+let _mlReady=false;const _mlQueue=[];const _mlRegistry=new Set();
+ml.on('load',()=>{_mlReady=true;_mlQueue.splice(0).forEach(f=>{try{f();}catch(e){}});});
+function whenReady(f){_mlReady?f():_mlQueue.push(f);}
+ml.on('style.load',()=>{setTimeout(()=>{_mlRegistry.forEach(o=>{try{o._install();}catch(e){}});},0);});
+
+// ── CAPA DE COMPATIBILIDAD ──
+// Adapta las llamadas estilo Leaflet del resto del código a MapLibre GL,
+// para no tocar la lógica de rutas/clientes/paneles/Firebase.
+let _lid=0;
+function _toLngLat(x){
+  if(Array.isArray(x)) return [x[1],x[0]];       // [lat,lng] → [lng,lat]
+  if(x&&x.lng!=null&&x.lat!=null) return [x.lng,x.lat];
+  return x;
+}
+function LZ(z){return Math.max(1,(z||16)-1);}     // zoom Leaflet(256px) → MapLibre(512px)
+
+const L={
+  divIcon(o){return {_divIcon:o};},
+  point(x,y){return {x,y};},
+  DomEvent:{stop(e){try{e.stopPropagation&&e.stopPropagation();e.preventDefault&&e.preventDefault();}catch(_){}}},
+  latLngBounds(arr){
+    let minLa=90,maxLa=-90,minLo=180,maxLo=-180;
+    (arr||[]).forEach(p=>{const la=Array.isArray(p)?p[0]:p.lat,lo=Array.isArray(p)?p[1]:p.lng;
+      if(la<minLa)minLa=la;if(la>maxLa)maxLa=la;if(lo<minLo)minLo=lo;if(lo>maxLo)maxLo=lo;});
+    return {_b:[[minLo,minLa],[maxLo,maxLa]]};
+  },
+  marker(ll,opts){
+    opts=opts||{};
+    const ic=(opts.icon&&opts.icon._divIcon)||{};
+    const el=document.createElement('div');
+    el.className=ic.className||'';
+    el.innerHTML=ic.html||'';
+    if(ic.iconSize){el.style.width=ic.iconSize[0]+'px';el.style.height=ic.iconSize[1]+'px';}
+    if(opts.zIndexOffset)el.style.zIndex=String(opts.zIndexOffset);
+    const isCursor=(ic.className==='nav-wrap');
+    const ax=(ic.iconAnchor&&ic.iconAnchor[0])||0, ay=(ic.iconAnchor&&ic.iconAnchor[1])||0;
+    const mk=new maplibregl.Marker({
+      element:el,anchor:'top-left',offset:[-ax,-ay],
+      rotationAlignment:isCursor?'map':'viewport',   // cursor gira con el mapa; pines siempre derechos
+      pitchAlignment:'viewport'
+    }).setLngLat(_toLngLat(ll));
+    return {
+      _mk:mk,_el:el,
+      addTo(){mk.addTo(ml);return this;},
+      setLatLng(l2){mk.setLngLat(_toLngLat(l2));return this;},
+      setIcon(ic2){
+        const d=ic2._divIcon||{};
+        el.className=d.className||'';el.innerHTML=d.html||'';
+        if(d.iconSize){el.style.width=d.iconSize[0]+'px';el.style.height=d.iconSize[1]+'px';}
+        const ax2=(d.iconAnchor&&d.iconAnchor[0])||0, ay2=(d.iconAnchor&&d.iconAnchor[1])||0;
+        mk.setOffset([-ax2,-ay2]);return this;
+      },
+      setRotation(r){mk.setRotation(r);return this;},
+      on(ev,fn){if(ev==='click')el.addEventListener('click',e=>{e.stopPropagation();fn(e);});return this;},
+      remove(){mk.remove();}
+    };
+  },
+  circle(ll,opts){
+    opts=opts||{};
+    const id='circ_'+(++_lid);
+    let la=Array.isArray(ll)?ll[0]:ll.lat, lo=Array.isArray(ll)?ll[1]:ll.lng, rad=opts.radius||20;
+    function geo(){
+      const pts=[];
+      for(let i=0;i<=64;i++){
+        const a=i/64*2*Math.PI;
+        pts.push([lo+(rad*Math.sin(a))/(111320*Math.cos(la*Math.PI/180)), la+(rad*Math.cos(a))/111320]);
+      }
+      return {type:'Feature',geometry:{type:'Polygon',coordinates:[pts]}};
+    }
+    const obj={
+      _install(){
+        if(ml.getSource(id))return;
+        ml.addSource(id,{type:'geojson',data:geo()});
+        ml.addLayer({id,type:'fill',source:id,paint:{'fill-color':opts.fillColor||'rgba(0,188,212,0.06)'}});
+        ml.addLayer({id:id+'_l',type:'line',source:id,paint:{'line-color':opts.color||'rgba(0,188,212,0.2)','line-width':opts.weight||1}});
+      },
+      _refresh(){const s=ml.getSource(id);if(s)s.setData(geo());},
+      addTo(){_mlRegistry.add(obj);whenReady(()=>obj._install());return obj;},
+      setLatLng(l2){la=Array.isArray(l2)?l2[0]:l2.lat;lo=Array.isArray(l2)?l2[1]:l2.lng;whenReady(()=>obj._refresh());return obj;},
+      setRadius(r2){rad=r2;whenReady(()=>obj._refresh());return obj;},
+      remove(){_mlRegistry.delete(obj);whenReady(()=>{try{if(ml.getLayer(id+'_l'))ml.removeLayer(id+'_l');if(ml.getLayer(id))ml.removeLayer(id);if(ml.getSource(id))ml.removeSource(id);}catch(e){}});}
+    };
+    return obj;
+  },
+  polyline(coords,st){
+    st=st||{};
+    const id='pl_'+(++_lid);
+    const data={type:'Feature',geometry:{type:'LineString',coordinates:(coords||[]).map(c=>[c[1],c[0]])}};
+    const obj={
+      _install(){
+        if(ml.getSource(id))return;
+        ml.addSource(id,{type:'geojson',data});
+        ml.addLayer({id,type:'line',source:id,
+          layout:{'line-join':'round','line-cap':'round'},
+          paint:{'line-color':st.color||'#7B2FBE','line-width':st.weight||6,'line-opacity':st.opacity!=null?st.opacity:1}});
+      },
+      addTo(){_mlRegistry.add(obj);whenReady(()=>obj._install());return obj;},
+      remove(){_mlRegistry.delete(obj);whenReady(()=>{try{if(ml.getLayer(id))ml.removeLayer(id);if(ml.getSource(id))ml.removeSource(id);}catch(e){}});}
+    };
+    return obj;
+  }
+};
+
+const map={
+  on(ev,fn){ml.on(ev,fn);},
+  panTo(ll,o){o=o||{};ml.easeTo({center:_toLngLat(ll),duration:o.animate===false?0:((o.duration||0.3)*1000)});},
+  flyTo(ll,z,o){o=o||{};ml.easeTo({center:_toLngLat(ll),zoom:LZ(z),duration:(o.duration||0.5)*1000});},
+  setView(ll,z,o){o=o||{};if(o.animate){ml.easeTo({center:_toLngLat(ll),zoom:LZ(z),duration:(o.duration||0.5)*1000});}else{ml.jumpTo({center:_toLngLat(ll),zoom:LZ(z)});}},
+  flyToBounds(b,o){o=o||{};const p=(o.padding&&o.padding.length)?o.padding:[60,60];
+    ml.fitBounds(b._b,{padding:{top:p[1]||60,bottom:(p[1]||60)+140,left:p[0]||60,right:p[0]||60},duration:(o.duration||0.8)*1000,maxZoom:LZ(o.maxZoom||17)});},
+  removeLayer(obj){if(obj&&obj.remove)obj.remove();},
+  getCenter(){const c=ml.getCenter();return {lat:c.lat,lng:c.lng};},
+  getContainer(){return ml.getContainer();},
+  latLngToContainerPoint(ll){const p=ml.project(_toLngLat(ll));return {x:p.x,y:p.y};},
+  containerPointToLatLng(pt){const u=ml.unproject([pt.x,pt.y]);return {lat:u.lat,lng:u.lng};},
+  panBy(d,o){ml.panBy(d,{duration:0});},
+  invalidateSize(){try{ml.resize();}catch(e){}},
+  createPane(){},
+  getPane(){return {style:{}};}
+};
+// Pines de clientes ya quedan derechos de forma nativa — anular la contra-rotación CSS
+document.documentElement.style.setProperty('--bearing','0deg');
 // ═══ TACÓMETRO ═══
 const TACHO_SEGS=30,MAX_SPD=120;
 function buildTacho(){
@@ -465,24 +612,12 @@ function updateTacho(kmh){
 document.addEventListener('DOMContentLoaded',()=>buildTacho());
 
 let isDark=true;
-const TILES={
-  dark:'https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png',
-  dark_labels:'https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png',
-  light:'https://{s}.basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}{r}.png',
-  light_labels:'https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}{r}.png'
-};
-// Create custom pane for labels (higher z-index so labels appear on top)
-map.createPane('labelsPane');
-map.getPane('labelsPane').style.zIndex=450;
-map.getPane('labelsPane').style.pointerEvents='none';
-
-let tileLayer=L.tileLayer(TILES.dark,{maxZoom:20,keepBuffer:12,updateWhenIdle:false,updateWhenZooming:true,crossOrigin:true}).addTo(map);
-let labelsLayer=L.tileLayer(TILES.dark_labels,{maxZoom:20,keepBuffer:12,updateWhenIdle:false,updateWhenZooming:true,crossOrigin:true,pane:'labelsPane'}).addTo(map);
-
+// (Los tiles ahora son vectoriales y vienen definidos por el estilo GL de CARTO.
+//  Las etiquetas de calles las dibuja el motor en tiempo real: siempre pegadas a
+//  su calle y siempre legibles — se voltean solas al navegar hacia el sur.)
 function toggleTheme(){
   isDark=!isDark;
-  tileLayer.setUrl(isDark?TILES.dark:TILES.light);
-  labelsLayer.setUrl(isDark?TILES.dark_labels:TILES.light_labels);
+  ml.setStyle(isDark?CARTO_STYLES.dark:CARTO_STYLES.light);
   document.body.className=isDark?'':'light';
   const btn=document.getElementById('fabTheme');
   if(btn) btn.textContent=isDark?'🌙':'☀️';
@@ -546,9 +681,8 @@ function selectCursor(type){
       iconSize:type==='bee'?[32,45]:[30,35],
       iconAnchor:type==='bee'?[16,23]:[15,18]
     }));
-    // Re-apply rotation
-    const cEl=document.querySelector('.nav-wrap svg, .nav-wrap img');
-    if(cEl) cEl.style.transform=`rotate(${curH}deg)`;
+    // Re-aplicar rotación con MapLibre
+    if(dispLat!=null) applyDisplayPosition();
   }
 }
 
@@ -561,38 +695,11 @@ function closeCursorPicker(){ document.getElementById('cursorPicker').classList.
 
 function lerpAngle(a,b,t){let d=b-a;while(d>180)d-=360;while(d<-180)d+=360;return a+d*t;}
 
-let _bWrap=null;
-function ensureBearingWrap(){
-  if(_bWrap)return _bWrap;
-  const pane=document.querySelector('#map .leaflet-map-pane');
-  if(!pane)return null;
-  _bWrap=document.createElement('div');
-  _bWrap.style.cssText='position:absolute;inset:0;will-change:transform;transition:transform 0s;';
-  pane.parentNode.insertBefore(_bWrap,pane);
-  _bWrap.appendChild(pane);
-  return _bWrap;
-}
+// ═══ ROTACIÓN NATIVA ═══
+// MapLibre rota el mapa por GPU con setBearing(): las etiquetas se re-dibujan
+// siempre legibles y pegadas a su calle. Se elimina todo el hack CSS anterior.
 function setMapBearing(deg){
-  const w=ensureBearingWrap();
-  if(!w) return;
-  updateBearingOrigin();
-  w.style.transform=`rotate(${deg}deg)`;
-  // Counter-rotate labels pane so street names stay readable
-  // Must use same transform-origin as the bearing wrap
-  const labelsPane=map.getPane('labelsPane');
-  if(labelsPane){
-    const mapH=map.getContainer().offsetHeight;
-    const mapW=map.getContainer().offsetWidth;
-    const cursorY=mapH - 185 - 36;
-    const cursorX=mapW/2;
-    labelsPane.style.transformOrigin=`${cursorX}px ${cursorY}px`;
-    labelsPane.style.transform=`rotate(${-deg}deg)`;
-    labelsPane.style.transition='transform 0s';
-  }
-  // Counter-rotate client pins via CSS variable
-  document.documentElement.style.setProperty('--bearing', `${-deg}deg`);
-  clearTimeout(window._invTimer);
-  window._invTimer=setTimeout(()=>{try{map.invalidateSize({pan:false});}catch(e){}},400);
+  ml.setBearing(-deg);
 }
 
 // ── Proyección de un punto (lat,lng) sobre el segmento a→b (arrays [lat,lng]) ──
@@ -672,11 +779,18 @@ function applyDisplayPosition(){
   if(!userMarker) return;
   userMarker.setLatLng([dispLat,dispLng]);
   if(accuracyCircle) accuracyCircle.setLatLng([dispLat,dispLng]);
-  const cEl=document.querySelector('.nav-wrap svg, .nav-wrap img');
-  if(cEl) cEl.style.transform=`rotate(${dispBearing}deg)`;
+
   if(isFollowing){
+    // Modo Waze: el mapa rota para que la dirección de avance apunte hacia
+    // arriba, y el cursor se mantiene visualmente apuntando hacia arriba.
     setMapBearing(-dispBearing);
-    map.panTo(getOffsetCenter(dispLat,dispLng),{animate:false,noMoveStart:true});
+    // El marcador está alineado al mapa (rotationAlignment:'map'), así que para
+    // que en pantalla apunte hacia arriba debe contrarrestar la rotación del mapa.
+    userMarker.setRotation(dispBearing);
+    map.panTo(getOffsetCenter(dispLat,dispLng),{animate:false});
+  } else {
+    // Modo libre (norte arriba o rotado a mano): el cursor apunta a su rumbo real.
+    userMarker.setRotation(dispBearing - (-ml.getBearing()));
   }
 }
 
@@ -720,13 +834,21 @@ function updateUserPosition(lat,lng,accuracy,speed,hdg){
   // Actualizamos el ancla de quietud a la posición ya confirmada/snapeada
   stableLat=targetLat; stableLng=targetLng;
 
-  // Heading: si vamos sobre una calle conocida, mezclamos rumbo GPS + rumbo real de la vía
-  // (el rumbo de la vía es mucho más estable que el sensor del celular)
-  if(kmh > 2){
+  // ── Rotación estilo Waze: amortiguada y solo con cambios reales de rumbo ──
+  // 1) Zona muerta: cambios de rumbo < 6° se ignoran (ruido del sensor).
+  // 2) Suavizado adaptado a velocidad: a baja velocidad el rumbo GPS es poco
+  //    confiable, así que el mapa gira lento; a velocidad de manejo gira más ágil.
+  // 3) Si vamos snapeados a una vía, el rumbo real de la calle domina (70%),
+  //    porque es muchísimo más estable que la brújula/GPS del celular.
+  if(kmh > 5){
     const gpsH = hdg!=null?hdg:curH;
-    const blended = roadBearing!=null ? lerpAngle(gpsH,roadBearing,0.5) : gpsH;
-    smoothH=lerpAngle(smoothH,blended,0.6);
-    curH=smoothH;
+    const blended = roadBearing!=null ? lerpAngle(gpsH,roadBearing,0.7) : gpsH;
+    let dH=blended-smoothH; while(dH>180)dH-=360; while(dH<-180)dH+=360;
+    if(Math.abs(dH) >= 6){
+      const f = kmh<12 ? 0.18 : (kmh<25 ? 0.35 : 0.5);
+      smoothH=lerpAngle(smoothH,blended,f);
+      curH=smoothH;
+    }
   }
 
   if(!userMarker){
@@ -737,6 +859,7 @@ function updateUserPosition(lat,lng,accuracy,speed,hdg){
     userMarker.on('click', function(){ openCursorPicker(); });
     accuracyCircle=L.circle([targetLat,targetLng],{radius:Math.min(accuracy||20,120),fillColor:'rgba(0,188,212,0.06)',fillOpacity:1,color:'rgba(0,188,212,0.2)',weight:1}).addTo(map);
     dispLat=targetLat; dispLng=targetLng; dispBearing=curH;
+    whenReady(applyCursorPadding);
     map.setView(getOffsetCenter(targetLat,targetLng),20);
     applyDisplayPosition();
   } else {
@@ -762,150 +885,31 @@ function recenter(){
 }
 function centerOnUser(){recenter();}
 function onSpeedometerClick(){if(!isFollowing)recenter();}
-map.on('dragstart',()=>{isFollowing=false;document.getElementById('speedometer').classList.add('recenter-mode');});
+// ═══ GESTOS: MapLibre maneja pan/zoom/rotación de forma nativa ═══
+// Ya no hace falta compensar el pan por el ángulo (MapLibre lo hace solo),
+// ni un manejador de rotación con 2 dedos (viene incluido). Solo detectamos
+// cuando el usuario interactúa para salir del modo "seguir" y mostrar el botón
+// de re-centrar.
+ml.dragRotate.enable();
+ml.touchZoomRotate.enable();
+ml.touchZoomRotate.enableRotation();
 
-// ═══ TOUCH MANAGER: ROTACIÓN (2 dedos) + PAN COMPENSADO (1 dedo) ═══
-//
-// Problema: Leaflet no sabe que el mapa está rotado visualmente, entonces
-// cuando el usuario arrastra con 1 dedo, el pan se hace en coordenadas
-// del mapa sin rotar. Si el norte está a la izquierda y deslizás hacia
-// arriba, el mapa se mueve horizontalmente en pantalla.
-//
-// Solución: manejamos TODO nosotros con capture:true y pasamos a Leaflet
-// un delta de pan ya compensado por el ángulo de rotación actual.
-(function(){
-  const mapEl = document.getElementById('map');
-
-  // ── Estado compartido ──
-  let _manualBearing = 0;   // bearing acumulado (grados)
-  let _currentBearing = 0;  // alias de lectura rápida
-
-  // ── Estado 1 dedo (pan compensado) ──
-  let _panActive = false;
-  let _panLastX = 0, _panLastY = 0;
-
-  // ── Estado 2 dedos (rotación) ──
-  let _rotActive = false;
-  let _rotStartAngle = 0;
-  let _rotStartBearing = 0;
-  let _rotLastDist = 0;
-  let _rotDecided = false;   // ya decidimos si es rotate o zoom
-
-  // ── Helpers ──
-  function angle2(t0, t1){
-    return Math.atan2(t1.clientY - t0.clientY, t1.clientX - t0.clientX) * 180 / Math.PI;
+function _exitFollow(){
+  if(isFollowing){
+    isFollowing=false;
+    const sp=document.getElementById('speedometer');
+    if(sp) sp.classList.add('recenter-mode');
   }
-  function dist2(t0, t1){
-    const dx = t1.clientX - t0.clientX, dy = t1.clientY - t0.clientY;
-    return Math.sqrt(dx * dx + dy * dy);
-  }
+}
+// Solo reacciona a gestos originados por el usuario (no a nuestras cámaras programáticas)
+ml.on('dragstart',e=>{ if(e&&e.originalEvent) _exitFollow(); });
+ml.on('rotatestart',e=>{ if(e&&e.originalEvent) _exitFollow(); });
+ml.on('zoomstart',e=>{ if(e&&e.originalEvent) _exitFollow(); });
 
-  // Rota un vector (dx, dy) por -bearing para pasar de espacio-pantalla
-  // al espacio-mapa (sin rotar). bearing en grados.
-  function rotateVector(dx, dy, bearingDeg){
-    const rad = -bearingDeg * Math.PI / 180;
-    return {
-      x:  dx * Math.cos(rad) - dy * Math.sin(rad),
-      y:  dx * Math.sin(rad) + dy * Math.cos(rad)
-    };
-  }
-
-  // ── TOUCHSTART ──
-  mapEl.addEventListener('touchstart', function(e){
-    if(e.touches.length === 1){
-      // 1 dedo: preparar pan compensado
-      _panActive = true;
-      _panLastX = e.touches[0].clientX;
-      _panLastY = e.touches[0].clientY;
-      _rotActive = false;
-    } else if(e.touches.length === 2){
-      // 2 dedos: preparar rotación
-      _panActive = false;
-      _rotActive = true;
-      _rotDecided = false;
-      _rotStartAngle  = angle2(e.touches[0], e.touches[1]);
-      _rotStartBearing = _manualBearing;
-      _rotLastDist    = dist2(e.touches[0], e.touches[1]);
-    }
-  }, {passive: true, capture: true});
-
-  // ── TOUCHMOVE ──
-  mapEl.addEventListener('touchmove', function(e){
-
-    // ── 1 dedo: pan compensado ──
-    if(e.touches.length === 1 && _panActive){
-      const dx = e.touches[0].clientX - _panLastX;
-      const dy = e.touches[0].clientY - _panLastY;
-      _panLastX = e.touches[0].clientX;
-      _panLastY = e.touches[0].clientY;
-
-      // Si el mapa no está rotado, dejamos que Leaflet lo maneje normal
-      const bearing = _manualBearing % 360;
-      if(Math.abs(bearing) < 2){
-        return; // rotación casi cero → comportamiento normal de Leaflet
-      }
-
-      // Compensar: rotar el vector de pantalla al espacio del mapa
-      e.preventDefault();
-      e.stopPropagation();
-      const compensated = rotateVector(dx, dy, _manualBearing);
-      map.panBy([-compensated.x, -compensated.y], {animate: false, noMoveStart: true});
-      return;
-    }
-
-    // ── 2 dedos: rotación o zoom ──
-    if(e.touches.length === 2 && _rotActive){
-      const t0 = e.touches[0], t1 = e.touches[1];
-      const curAngle = angle2(t0, t1);
-      const curDist  = dist2(t0, t1);
-      const deltaRot = curAngle - _rotStartAngle;
-      const deltaDist = Math.abs(curDist - _rotLastDist);
-
-      // Decidir si es rotación (giro predominante) o zoom (pinch predominante)
-      if(!_rotDecided){
-        if(Math.abs(deltaRot) > 6){
-          _rotDecided = true;
-        } else if(deltaDist > 12){
-          _rotActive = false; // es zoom → dejar a Leaflet
-          return;
-        }
-      }
-
-      if(_rotDecided){
-        e.preventDefault();
-        e.stopPropagation();
-        _manualBearing = _rotStartBearing + deltaRot;
-        _currentBearing = _manualBearing;
-        setMapBearing(_manualBearing);
-        isFollowing = false;
-        document.getElementById('speedometer').classList.add('recenter-mode');
-      }
-
-      _rotLastDist = curDist;
-    }
-
-  }, {passive: false, capture: true});
-
-  // ── TOUCHEND ──
-  mapEl.addEventListener('touchend', function(e){
-    if(e.touches.length === 0){
-      _panActive = false;
-      _rotActive = false;
-      _rotDecided = false;
-    } else if(e.touches.length === 1){
-      // Quedó 1 dedo → preparar pan desde esa posición
-      _rotActive = false;
-      _rotDecided = false;
-      _panActive = true;
-      _panLastX = e.touches[0].clientX;
-      _panLastY = e.touches[0].clientY;
-    }
-  }, {passive: true, capture: true});
-
-  // ── API pública ──
-  window._getManualBearing = function(){ return _manualBearing; };
-  window._setManualBearing = function(b){ _manualBearing = b; _currentBearing = b; };
-})();
+// Shim de compatibilidad: recenter() aún llama a esto. Con rotación nativa
+// no necesitamos guardar un bearing manual, así que es un no-op seguro.
+window._getManualBearing=function(){ return -ml.getBearing(); };
+window._setManualBearing=function(){};
 map.on('click',()=>{closePopup();collapseSearchPanel();});
 function onGpsUpdate(lat,lng,accuracy,speed){updateUserPosition(lat,lng,accuracy,speed);}
 if(navigator.geolocation){
@@ -1057,35 +1061,25 @@ function updateFloatingButtons(){
   }
 }
 
-// Helper: calcula la LatLng objetivo para que el cursor quede
-// al mismo nivel vertical que el velocímetro/alerta, centrado horizontal
-function getOffsetCenter(lat,lng){
-  const mapH=map.getContainer().offsetHeight;
-  // Posición del cursor: mismo nivel que speedometer (bottom ~185px + 36px mitad icono)
-  const targetY=mapH - 185 - 36;
-  // Centro horizontal
-  const targetX=map.getContainer().offsetWidth/2;
-  
-  // Mover el centro del mapa para que [lat,lng] quede en (targetX, targetY)
-  const currentPt=map.latLngToContainerPoint([lat,lng]);
-  const centerPt=map.latLngToContainerPoint(map.getCenter());
-  return map.containerPointToLatLng(L.point(
-    centerPt.x + (currentPt.x - targetX),
-    centerPt.y + (currentPt.y - targetY)
-  ));
+// Con MapLibre usamos "padding" de cámara: desplazamos el centro visual del
+// mapa hacia abajo, de modo que la posición del usuario quede al nivel del
+// velocímetro. La rotación nativa pivota alrededor de ese centro padded, así
+// que el cursor se mantiene fijo en su lugar aunque el mapa gire. Ya no hay
+// que compensar en píxeles como con Leaflet.
+function applyCursorPadding(){
+  try{
+    const mapH=ml.getContainer().offsetHeight;
+    // El cursor está a ~ (185+36) px desde abajo. El centro está en mapH/2.
+    // padding.bottom empuja el centro hacia arriba tantos px como (mapH/2 - cursorY).
+    const cursorFromBottom=185+36;
+    const bottomPad=Math.max(0, mapH - 2*cursorFromBottom);
+    ml.setPadding({top:0,bottom:bottomPad,left:0,right:0},{duration:0});
+  }catch(e){}
 }
+whenReady(applyCursorPadding);
 
-// Actualizar el transform-origin del bearing wrap para que rote
-// alrededor de la posición del cursor (no del centro de la pantalla)
-function updateBearingOrigin(){
-  const w=ensureBearingWrap();
-  if(!w)return;
-  const mapH=map.getContainer().offsetHeight;
-  const mapW=map.getContainer().offsetWidth;
-  const cursorY=mapH - 185 - 36;
-  const cursorX=mapW/2;
-  w.style.transformOrigin=`${cursorX}px ${cursorY}px`;
-}
+function getOffsetCenter(lat,lng){ return {lat,lng}; } // el padding ya hace el offset
+function updateBearingOrigin(){ /* no aplica con rotación nativa */ }
 // Observer para detectar cambios de altura en la barra
 const _barObs=new ResizeObserver(()=>updateFloatingButtons());
 document.addEventListener('DOMContentLoaded',()=>{
