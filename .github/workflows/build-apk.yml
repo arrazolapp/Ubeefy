@@ -33,10 +33,10 @@ jobs:
       run: ./gradlew assembleDebug
 
     - name: Rename APK
-      run: mv app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/Ubeefy_V.1.0.2.1.apk
+      run: mv app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/Ubeefy_V.1.0.2.2.apk
 
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: Ubeefy_V.1.0.2.1
-        path: app/build/outputs/apk/debug/Ubeefy_V.1.0.2.1.apk
+        name: Ubeefy_V.1.0.2.2
+        path: app/build/outputs/apk/debug/Ubeefy_V.1.0.2.2.apk
