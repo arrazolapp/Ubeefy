@@ -508,6 +508,12 @@ document.addEventListener('visibilitychange',()=>{
 let userMarker=null,accuracyCircle=null;
 let userLat=0,userLng=0,curH=0,smoothH=0,isFollowing=true;
 
+// ═══ MOVIMIENTO INMERSIVO (chase-cam) + SNAP A LA VÍA ═══
+let dispLat=null,dispLng=null,dispBearing=0,lastFixAt=0;
+let animFrame=null,animFromLat=0,animFromLng=0,animToLat=0,animToLng=0,animFromBearing=0,animToBearing=0,animStart=0,animDur=900;
+let roadSnap=null,roadSnapBusy=false;
+const OSRM_NEAREST_HOSTS=['https://router.project-osrm.org','https://routing.openstreetmap.de/routed-car'];
+
 const CURSOR_ARROW=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 115" width="30" height="35">
   <defs>
     <filter id="cs"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="rgba(0,0,0,0.4)"/></filter>
@@ -588,10 +594,99 @@ function setMapBearing(deg){
   window._invTimer=setTimeout(()=>{try{map.invalidateSize({pan:false});}catch(e){}},400);
 }
 
+// ── Proyección de un punto (lat,lng) sobre el segmento a→b (arrays [lat,lng]) ──
+// Trabaja en metros locales (aproximación equirectangular, válida a escala de calle)
+function projectOnSegment(lat,lng,a,b){
+  const mLat=111320, mLng=111320*Math.cos(lat*Math.PI/180);
+  const px=(lng-a[1])*mLng, py=(lat-a[0])*mLat;
+  const dx=(b[1]-a[1])*mLng, dy=(b[0]-a[0])*mLat;
+  const len2=dx*dx+dy*dy;
+  let t = len2>0 ? ((px*dx+py*dy)/len2) : 0;
+  t=Math.max(0,Math.min(1,t));
+  const projLat=a[0]+(b[0]-a[0])*t;
+  const projLng=a[1]+(b[1]-a[1])*t;
+  const distM=Math.hypot(px-dx*t,py-dy*t);
+  const bearing=(Math.atan2(dx,dy)*180/Math.PI+360)%360; // rumbo real de la calle a→b
+  return {lat:projLat,lng:projLng,dist:distM,t,bearing};
+}
+
+// Busca el punto más cercano sobre TODA la polilínea de la ruta activa (no solo vértices)
+function snapToRoute(lat,lng){
+  if(routeCoords.length<2) return null;
+  let best=null;
+  for(let i=0;i<routeCoords.length-1;i++){
+    const p=projectOnSegment(lat,lng,routeCoords[i],routeCoords[i+1]);
+    if(!best||p.dist<best.dist) best=p;
+  }
+  // Si estamos a más de 40m de la ruta trazada, probablemente el usuario se salió
+  // (recalculando) — mejor no forzar el snap y mostrar la posición real
+  if(!best||best.dist>40) return null;
+  return best;
+}
+
+// Snap a la calle más cercana cuando NO hay ruta activa (navegación libre),
+// usando el servicio "nearest" de OSRM. Se corre en segundo plano y no bloquea
+// el fix actual: el resultado se usa recién en el próximo update.
+async function refreshRoadSnap(lat,lng){
+  if(roadSnapBusy) return;
+  roadSnapBusy=true;
+  for(const host of OSRM_NEAREST_HOSTS){
+    try{
+      const r=await fetch(`${host}/nearest/v1/driving/${lng},${lat}?number=1`,{cache:'no-store'});
+      const j=await r.json();
+      const wp=j&&j.waypoints&&j.waypoints[0];
+      // Solo confiamos en el snap si la vía más cercana está a <35m (si no, puede
+      // ser un parqueo/patio y forzar el snap se vería peor que dejar el GPS crudo)
+      roadSnap=(wp&&wp.distance<=35)?{lat:wp.location[1],lng:wp.location[0],at:Date.now()}:null;
+      roadSnapBusy=false;
+      return;
+    }catch(e){ /* probar siguiente host */ }
+  }
+  roadSnapBusy=false;
+}
+
+// ── Motor de animación "chase-cam": interpola posición + rotación cuadro a cuadro ──
+function easeOutCubic(t){return 1-Math.pow(1-t,3);}
+function startAnim(toLat,toLng,toBearing,durMs){
+  // Siempre arranca desde lo que se está mostrando AHORA (no desde el último fix),
+  // así si llega un fix nuevo a mitad de camino la transición sigue fluida
+  animFromLat = dispLat!=null?dispLat:toLat;
+  animFromLng = dispLng!=null?dispLng:toLng;
+  animFromBearing = dispBearing;
+  animToLat=toLat; animToLng=toLng; animToBearing=toBearing;
+  animStart=performance.now(); animDur=durMs;
+  if(animFrame) cancelAnimationFrame(animFrame);
+  animFrame=requestAnimationFrame(stepAnim);
+}
+function stepAnim(now){
+  const t=Math.min(1,(now-animStart)/animDur);
+  const e=easeOutCubic(t);
+  dispLat=animFromLat+(animToLat-animFromLat)*e;
+  dispLng=animFromLng+(animToLng-animFromLng)*e;
+  dispBearing=lerpAngle(animFromBearing,animToBearing,e);
+  applyDisplayPosition();
+  animFrame = t<1 ? requestAnimationFrame(stepAnim) : null;
+}
+function applyDisplayPosition(){
+  if(!userMarker) return;
+  userMarker.setLatLng([dispLat,dispLng]);
+  if(accuracyCircle) accuracyCircle.setLatLng([dispLat,dispLng]);
+  const cEl=document.querySelector('.nav-wrap svg, .nav-wrap img');
+  if(cEl) cEl.style.transform=`rotate(${dispBearing}deg)`;
+  if(isFollowing){
+    setMapBearing(-dispBearing);
+    map.panTo(getOffsetCenter(dispLat,dispLng),{animate:false,noMoveStart:true});
+  }
+}
+
 function updateUserPosition(lat,lng,accuracy,speed,hdg){
   const kmh=speed?Math.round(Math.abs(speed)*3.6):0;
   document.getElementById('speedVal').textContent=kmh;
   updateTacho(kmh);
+
+  const now=performance.now();
+  const dt=lastFixAt? (now-lastFixAt) : 3000;
+  lastFixAt=now;
 
   // Solo ignorar si estamos COMPLETAMENTE quietos (< 2 km/h Y < 2m de cambio)
   if(userLat && userLng && kmh < 2){
@@ -601,36 +696,43 @@ function updateUserPosition(lat,lng,accuracy,speed,hdg){
 
   userLat=lat;userLng=lng;
 
-  // Heading: tomar 60% del nuevo valor para respuesta rápida
-  if(hdg!=null && kmh > 2){
-    smoothH=lerpAngle(smoothH,hdg,0.6);
+  // ── Snap a la vía: el ícono queda clavado sobre la línea real, no flotando al lado ──
+  let targetLat=lat, targetLng=lng, roadBearing=null;
+  if(navActive && routeCoords.length>=2){
+    const s=snapToRoute(lat,lng);
+    if(s){ targetLat=s.lat; targetLng=s.lng; roadBearing=s.bearing; }
+  } else {
+    if(roadSnap && (now-roadSnap.at)<6000){ targetLat=roadSnap.lat; targetLng=roadSnap.lng; }
+    if(kmh>3) refreshRoadSnap(lat,lng); // se resuelve en 2do plano, listo para el próximo fix
+  }
+
+  // Heading: si vamos sobre una calle conocida, mezclamos rumbo GPS + rumbo real de la vía
+  // (el rumbo de la vía es mucho más estable que el sensor del celular)
+  if(kmh > 2){
+    const gpsH = hdg!=null?hdg:curH;
+    const blended = roadBearing!=null ? lerpAngle(gpsH,roadBearing,0.5) : gpsH;
+    smoothH=lerpAngle(smoothH,blended,0.6);
     curH=smoothH;
   }
 
   if(!userMarker){
-    userMarker=L.marker([lat,lng],{
+    userMarker=L.marker([targetLat,targetLng],{
       icon:L.divIcon({className:'nav-wrap',html:`<div class="nav-glow"></div>${CURSOR}`,iconSize:cursorType==='bee'?[32,45]:[30,35],iconAnchor:cursorType==='bee'?[16,23]:[15,18]}),
       zIndexOffset:1000,interactive:true
     }).addTo(map);
     userMarker.on('click', function(){ openCursorPicker(); });
-    accuracyCircle=L.circle([lat,lng],{radius:Math.min(accuracy||20,120),fillColor:'rgba(0,188,212,0.06)',fillOpacity:1,color:'rgba(0,188,212,0.2)',weight:1}).addTo(map);
-    map.setView(getOffsetCenter(lat,lng),20);
+    accuracyCircle=L.circle([targetLat,targetLng],{radius:Math.min(accuracy||20,120),fillColor:'rgba(0,188,212,0.06)',fillOpacity:1,color:'rgba(0,188,212,0.2)',weight:1}).addTo(map);
+    dispLat=targetLat; dispLng=targetLng; dispBearing=curH;
+    map.setView(getOffsetCenter(targetLat,targetLng),20);
+    applyDisplayPosition();
   } else {
-    userMarker.setLatLng([lat,lng]);
-    accuracyCircle.setLatLng([lat,lng]).setRadius(Math.min(accuracy||20,120));
+    accuracyCircle.setRadius(Math.min(accuracy||20,120));
+    // Duración de la animación = tiempo real desde el fix anterior (con límites de seguridad)
+    const durMs=Math.max(600,Math.min(dt,4000));
+    startAnim(targetLat,targetLng,curH,durMs);
   }
 
-  // Rotar mapa cuando hay movimiento
-  if(isFollowing && kmh > 2){
-    setMapBearing(-curH);
-  }
-  const cEl=document.querySelector('.nav-wrap svg, .nav-wrap img');
-  if(cEl) cEl.style.transform=`rotate(${curH}deg)`;
-
-  if(isFollowing&&userLat){
-    map.panTo(getOffsetCenter(lat,lng),{animate:true,duration:0.3,easeLinearity:0.3,noMoveStart:true});
-  }
-  if(navActive&&navTarget){updateNavInfo();updateRouteProgress(lat,lng);}
+  if(navActive&&navTarget){updateNavInfo();updateRouteProgress(targetLat,targetLng);}
 }
 
 function recenter(){
@@ -640,8 +742,9 @@ function recenter(){
   // Sincronizar bearing manual con el heading del GPS
   if(window._setManualBearing) window._setManualBearing(-curH);
   setMapBearing(-curH);
-  // Centrar suavemente como Waze
-  map.flyTo(getOffsetCenter(userLat,userLng),20,{duration:0.4});
+  // Centrar suavemente como Waze — usa la posición mostrada (ya suavizada/snap a la vía)
+  const cLat=dispLat!=null?dispLat:userLat, cLng=dispLng!=null?dispLng:userLng;
+  map.flyTo(getOffsetCenter(cLat,cLng),20,{duration:0.4});
 }
 function centerOnUser(){recenter();}
 function onSpeedometerClick(){if(!isFollowing)recenter();}
