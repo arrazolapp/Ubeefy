@@ -512,6 +512,7 @@ let userLat=0,userLng=0,curH=0,smoothH=0,isFollowing=true;
 let dispLat=null,dispLng=null,dispBearing=0,lastFixAt=0;
 let animFrame=null,animFromLat=0,animFromLng=0,animToLat=0,animToLng=0,animFromBearing=0,animToBearing=0,animStart=0,animDur=900;
 let roadSnap=null,roadSnapBusy=false;
+let stableLat=null,stableLng=null; // ancla usada para el filtro de quietud (evita que el GPS "baile" con el celular parado)
 const OSRM_NEAREST_HOSTS=['https://router.project-osrm.org','https://routing.openstreetmap.de/routed-car'];
 
 const CURSOR_ARROW=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 115" width="30" height="35">
@@ -688,10 +689,20 @@ function updateUserPosition(lat,lng,accuracy,speed,hdg){
   const dt=lastFixAt? (now-lastFixAt) : 3000;
   lastFixAt=now;
 
-  // Solo ignorar si estamos COMPLETAMENTE quietos (< 2 km/h Y < 2m de cambio)
-  if(userLat && userLng && kmh < 2){
-    const moveDist=hav(userLat,userLng,lat,lng)*1000;
-    if(moveDist < 2) return;
+  // ── Filtro de quietud ──
+  // El GPS de un celular estático puede "bailar" varios metros por multipath
+  // (señal rebotada en edificios/paredes). Si no hay evidencia real de
+  // movimiento, no tocamos NADA (marcador, mapa, rotación) — todo se queda
+  // perfectamente estático hasta que haya un desplazamiento real de varios
+  // metros. El radio de tolerancia se adapta a la precisión que reporta el
+  // GPS en ese momento (si el GPS anda impreciso, exigimos más distancia).
+  const stillRadius = Math.min(25, Math.max(8, (accuracy||20)*0.6));
+  if(stableLat!=null){
+    const dFromStable = hav(stableLat,stableLng,lat,lng)*1000;
+    if(kmh < 4 && dFromStable < stillRadius){
+      userLat=lat; userLng=lng; // igual guardamos el fix crudo para cálculos de distancia/ETA
+      return;
+    }
   }
 
   userLat=lat;userLng=lng;
@@ -705,6 +716,9 @@ function updateUserPosition(lat,lng,accuracy,speed,hdg){
     if(roadSnap && (now-roadSnap.at)<6000){ targetLat=roadSnap.lat; targetLng=roadSnap.lng; }
     if(kmh>3) refreshRoadSnap(lat,lng); // se resuelve en 2do plano, listo para el próximo fix
   }
+
+  // Actualizamos el ancla de quietud a la posición ya confirmada/snapeada
+  stableLat=targetLat; stableLng=targetLng;
 
   // Heading: si vamos sobre una calle conocida, mezclamos rumbo GPS + rumbo real de la vía
   // (el rumbo de la vía es mucho más estable que el sensor del celular)
